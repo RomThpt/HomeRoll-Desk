@@ -56,6 +56,7 @@ struct MainView: View {
             switch lib.source {
             case .people: PeopleOverview(lib: lib)
             case .albums: AlbumsOverview(lib: lib)
+            case .folderList(let p): FoldersOverview(lib: lib, path: p)
             case .memories: MemoriesOverview(lib: lib)
             case .map: MapOverview(lib: lib)
             case .duplicates: DuplicatesOverview(lib: lib)
@@ -164,6 +165,8 @@ struct Sidebar: View {
                 item(.people, "person.2")
                 item(.map, "map")
                 item(.albums, "rectangle.stack")
+                // nur, wenn der Server echte Ordner hat (externe Bibliothek)
+                if !FolderStore.shared.paths.isEmpty { item(.folderList(""), "folder") }
             }
             Section("Media Types") {
                 item(.videos, "video")
@@ -206,6 +209,7 @@ struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        .task(id: AccountStore.shared.currentID) { await FolderStore.shared.load() }
     }
 
     private func item(_ s: Source, _ icon: String) -> some View { Label(s.title, systemImage: icon).tag(s) }

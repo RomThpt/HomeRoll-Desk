@@ -76,6 +76,43 @@ enum SelfTest {
         return cond()
     }
 
+    /// Server-Ordner: Übersicht, Ordner mit Unterordnern, letzter Ordner als Fotoraster, Zurück Ebene für Ebene
+    static func serverFoldersTest() async {
+        let store = FolderStore.shared
+        await store.load()
+        log("Ordner: Pfade geladen", !store.paths.isEmpty, "\(store.paths.count) Ordner, Wurzel \(FolderStore.name(store.root))")
+        lib.select(.folderList(""))
+        await wait(4)
+        snap("ordner-1-uebersicht")
+        let top = store.children(of: store.root)
+        guard let parent = top.first(where: { !store.children(of: $0).isEmpty }) else { log("Ordner: Ordner mit Unterordnern", false); return }
+        log("Ordner: oberste Ebene", !top.isEmpty, "\(top.count) Ordner")
+        let mosaic = await store.mosaic(parent)
+        log("Ordner: Mosaik", mosaic.count >= 1, "\(mosaic.count) Bilder, \(await store.summary(parent))")
+        lib.open(.folderList(parent))
+        await wait(3)
+        snap("ordner-2-unterordner")
+        guard let leaf = store.children(of: parent).first(where: { store.children(of: $0).isEmpty }) else { log("Ordner: letzter Ordner", false); return }
+        lib.open(.folder(leaf))
+        let ok = await waitFor(15) { !lib.loading && lib.totalCount > 0 }
+        log("Ordner: letzter Ordner als Raster", ok, "\(lib.totalCount) Objekte in \(FolderStore.name(leaf))")
+        await wait(2)
+        snap("ordner-3-raster")
+        lib.goBack()
+        await wait(1)
+        let back1 = lib.source == .folderList(parent)
+        lib.goBack()
+        await wait(1)
+        log("Ordner: Zurück Ebene für Ebene", back1 && lib.source == .folderList(""))
+        for sort in FolderSort.allCases {
+            UserDefaults.standard.set(sort.rawValue, forKey: "mac.folderSort")
+            await wait(1.5)
+        }
+        UserDefaults.standard.set(FolderSort.nameAsc.rawValue, forKey: "mac.folderSort")
+        log("Ordner: Sortierungen durchgeschaltet", true)
+        lib.select(.library)
+    }
+
     /// Live Photos: Abzeichen, Abspielen beim Öffnen/Zeigen, Loop/Bounce/Long Exposure (GitHub #8)
     static func liveTest() async {
         for i in lib.sections.indices { lib.ensureLoaded(i) }
@@ -179,6 +216,11 @@ enum SelfTest {
         if ProcessInfo.processInfo.environment["FOTOS_SELFTEST_ONLY"] == "albums" {
             await keyPhotoTest()
             await backTest()
+            return finish()
+        }
+        // nur Server-Ordner (GitHub #10): FOTOS_SELFTEST_ONLY=serverfolders (mit FOTOS_FOLDERS_ALL=1 auf Testservern)
+        if ProcessInfo.processInfo.environment["FOTOS_SELFTEST_ONLY"] == "serverfolders" {
+            await serverFoldersTest()
             return finish()
         }
         // nur Live Photos (GitHub #8): FOTOS_SELFTEST_ONLY=live

@@ -12,6 +12,8 @@ enum Source: Hashable {
     case memory(String, String)            // Rückblick: ID, Titel
     case city(String)                      // Ort aus der Karte
     case smart(String, String)             // intelligentes Album: ID, Name
+    case folder(String)                    // Fotos direkt in einem Server-Ordner (Pfad)
+    case folderList(String)                // Ordner-Übersicht ("" = oberste Ebene)
     case people, albums, memories, map, duplicates   // Übersichten (eigene Ansicht, kein Foto-Raster)
 
     var title: String {
@@ -22,9 +24,13 @@ enum Source: Hashable {
         case .search(let q): "Search: “\(q)”"; case .people: "People"; case .albums: "Albums"
         case .memory(_, let t): t; case .city(let c): c; case .smart(_, let n): n
         case .memories: "Memories"; case .map: "Map"; case .duplicates: "Duplicates"
+        case .folder(let p): FolderStore.name(p); case .folderList(let p): p.isEmpty ? "Folders" : FolderStore.name(p)
         }
     }
-    var isOverview: Bool { [.people, .albums, .memories, .map, .duplicates].contains(self) }
+    var isOverview: Bool {
+        if case .folderList = self { return true }
+        return [.people, .albums, .memories, .map, .duplicates].contains(self)
+    }
 
     /// Medienarten, die der Kategorien-Dienst als Tag setzt (gleiche Namen wie Category.tag der iPhone-App).
     static let mediaTags = ["Selfies", "Porträt", "Panoramen", "Zeitraffer", "Slo-Mo", "Kino", "Serien",
@@ -159,6 +165,7 @@ final class Library {
         sections = []; index = [:]; selection = []; focused = nil; viewer = nil; albums = []; people = []; memories = []
         SmartAlbums.shared.reload()
         tagIDs = [:]; fileNames = [:]; source = .library; sectionsSource = nil
+        FolderStore.shared.reset()
         onReloadAll?()
     }
 
@@ -308,10 +315,11 @@ final class Library {
             if memories.isEmpty { memories = (try? await api.memories()) ?? [] }
             return memories.first { $0.id == id }?.assets.map(\.asset) ?? []
         case .city(let c): return try await f(["city": ["eq": c]])
+        case .folder(let p): return await FolderStore.shared.assets(p)
         case .smart(let id, _):
             guard let sa = SmartAlbums.shared.albums.first(where: { $0.id == id }) else { return [] }
             return try await f(sa.filter, 5000)
-        case .library, .people, .albums, .memories, .map, .duplicates: return []
+        case .library, .people, .albums, .memories, .map, .duplicates, .folderList: return []
         }
     }
 
