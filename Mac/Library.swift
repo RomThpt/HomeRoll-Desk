@@ -80,7 +80,11 @@ final class Library {
     /// Auswahl (IDs) und das zuletzt angeklickte Objekt (für ⌘I und die Einzelansicht)
     var selection: Set<String> = []
     var focused: Asset?
-    var viewer: IndexPath?
+    var viewer: IndexPath? {
+        // Einzelansicht zu → Tastatur zurück ans Raster (sonst reagierten Pfeile/Leertaste nicht mehr, GitHub #11)
+        didSet { if viewer == nil, oldValue != nil { DispatchQueue.main.async { [weak self] in self?.onViewerClosed?() } } }
+    }
+    @ObservationIgnored var onViewerClosed: (() -> Void)?
     /// Zoomstufe des Rasters (Kantenlänge in Punkt), ⌘+ / ⌘−
     static let zoomSizes: [CGFloat] = [72, 104, 150, 210, 300]
     /// Monat oben im Raster (mitlaufende Kapsel, GitHub #7)

@@ -68,6 +68,10 @@ struct PhotoGrid: NSViewRepresentable {
         init(_ l: Library) { lib = l }
 
         func attach() {
+            lib.onViewerClosed = { [weak self] in
+                guard let cv = self?.cv, let w = cv.window else { return }
+                w.makeFirstResponder(cv)
+            }
             lib.onReloadAll = { [weak self] in self?.reloadAll() }
             lib.onReloadSection = { [weak self] s in
                 guard let cv = self?.cv, s < cv.numberOfSections else { self?.reloadAll(); return }

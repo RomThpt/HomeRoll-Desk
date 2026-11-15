@@ -156,6 +156,46 @@ enum SelfTest {
         log("Live: Langzeitbelichtung berechnet", le != nil, le.map { "\($0.width)×\($0.height)" } ?? "")
     }
 
+    /// Leertaste öffnet und schließt die Einzelansicht; danach muss das Raster wieder Tasten annehmen (GitHub #11).
+    static func keysTest() async {
+        NSApp.activate(ignoringOtherApps: true)
+        guard let w = NSApp.windows.first(where: { $0.isVisible && $0.frame.height > 300 }),
+              let first = lib.sections.first(where: { ($0.assets?.count ?? 0) > 2 }),
+              let s = lib.sections.firstIndex(where: { $0.id == first.id }) else { log("Tasten: Raster bereit", false); return }
+        w.makeKeyAndOrderFront(nil)
+        func grid() -> GridCollectionView? {
+            func walk(_ v: NSView) -> GridCollectionView? { (v as? GridCollectionView) ?? v.subviews.lazy.compactMap(walk).first }
+            return w.contentView.flatMap(walk)
+        }
+        func press(_ code: UInt16, _ chars: String) {
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                if let e = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                            windowNumber: w.windowNumber, context: nil, characters: chars,
+                                            charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
+                    NSApp.postEvent(e, atStart: false)
+                }
+            }
+        }
+        guard let cv = grid() else { log("Tasten: Raster gefunden", false); return }
+        let ip = IndexPath(item: 0, section: s)
+        cv.selectionIndexPaths = [ip]; lib.selection = Set([lib.asset(at: ip)?.id].compactMap { $0 })
+        w.makeFirstResponder(cv)
+        for round in 1...2 {
+            press(49, " ")
+            let opened = await waitFor(5) { lib.viewer != nil }
+            log("Tasten: Leertaste öffnet (\(round))", opened)
+            press(49, " ")
+            let closed = await waitFor(5) { lib.viewer == nil }
+            log("Tasten: Leertaste schließt (\(round))", closed)
+            await wait(0.5)
+            log("Tasten: Raster hat Tastatur (\(round))", w.firstResponder === cv, String(describing: type(of: w.firstResponder as Any)))
+        }
+        let before = cv.selectionIndexPaths
+        press(124, String(UnicodeScalar(NSRightArrowFunctionKey)!))
+        let moved = await waitFor(3) { cv.selectionIndexPaths != before }
+        log("Tasten: Pfeil wählt nächstes Foto", moved)
+    }
+
     static func snap(_ name: String, window: NSWindow? = nil) {
         guard let w = window ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) && $0.frame.height > 300 }),
               let img = windowImage(CGWindowID(w.windowNumber)) ?? viewImage(w.contentView)
@@ -206,6 +246,11 @@ enum SelfTest {
         _ = await waitFor(15) { lib.sections[last].assets != nil }
         await wait(2.5)
         snap("01-mediathek")
+        // nur Tastatur prüfen (GitHub #11): FOTOS_SELFTEST_ONLY=keys
+        if ProcessInfo.processInfo.environment["FOTOS_SELFTEST_ONLY"] == "keys" {
+            await keysTest()
+            return finish()
+        }
         // nur Fußzeile + Offline prüfen (schneller Durchlauf): FOTOS_SELFTEST_ONLY=footer
         if ProcessInfo.processInfo.environment["FOTOS_SELFTEST_ONLY"] == "footer" {
             await footerTests()
@@ -747,7 +792,7 @@ enum SelfTest {
     }
 
     private static func finish() {
-        print("SELBSTTEST FERTIG"); fflush(stdout)
+        print("SELBSTTEST FERTIG")
         NSApp.terminate(nil)
     }
 }
