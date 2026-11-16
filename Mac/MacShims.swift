@@ -12,6 +12,11 @@ final class ImageCache: @unchecked Sendable {
     private let lock = NSLock()
     init() { cache.totalCostLimit = 400 << 20 }
 
+    func clear() {
+        cache.removeAllObjects()
+        lock.withLock { hashes = [:]; versions = [:] }
+    }
+
     func setHash(_ id: String, _ h: String?) {
         guard let h else { return }
         let old = lock.withLock { () -> String? in let o = hashes[id]; hashes[id] = h; return o }
@@ -53,10 +58,11 @@ final class ImageCache: @unchecked Sendable {
 
     /// Speicher → Server (URLCache des Clients hält die Dateien auf der Platte). Entpacken außerhalb des Hauptthreads.
     func load(_ id: String, _ size: ImmichClient.Size) async -> CGImage? {
+        let revision = ImmichClient.shared.sessionRevision
         if let i = get(id, size) { return i }
         guard let url = ImmichClient.shared.thumbnailURL(id, size),
               let data = try? await ImmichClient.shared.data(url) else { return nil }
-        guard let img = Self.decode(data) else { return nil }
+        guard revision == ImmichClient.shared.sessionRevision, let img = Self.decode(data) else { return nil }
         cache.setObject(CGImageBox(img), forKey: "\(id)-\(size.rawValue)" as NSString, cost: img.bytesPerRow * img.height)
         return img
     }

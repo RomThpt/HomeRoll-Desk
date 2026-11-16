@@ -1239,7 +1239,7 @@ final class EditSession {
 
     private func dropCopy() async throws {
         let api = ImmichClient.shared
-        if let stackID { try? await api.raw("stacks/\(stackID)", method: "DELETE") }
+        if let stackID { _ = try? await api.raw("stacks/\(stackID)", method: "DELETE") }
         try await api.trash([asset.id])
     }
 

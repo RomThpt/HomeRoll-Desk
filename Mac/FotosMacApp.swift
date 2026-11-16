@@ -7,10 +7,14 @@ struct FotosMacApp: App {
 
     var body: some Scene {
         Window("HomeRoll Desktop", id: "main") {
-            MainView()
-                .frame(minWidth: 820, minHeight: 520)
+            Group {
+                if ProcessInfo.processInfo.environment["HOMEROLL_TESTING"] == "1" { Text("HomeRoll tests") }
+                else { MainView() }
+            }.frame(minWidth: 820, minHeight: 520)
         }
-        .commands { FotosCommands() }
+        .commands {
+            if ProcessInfo.processInfo.environment["HOMEROLL_TESTING"] != "1" { FotosCommands() }
+        }
         Settings { SettingsView() }
     }
 }
@@ -18,11 +22,8 @@ struct FotosMacApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
     func applicationDidFinishLaunching(_ n: Notification) {
+        guard ProcessInfo.processInfo.environment["HOMEROLL_TESTING"] != "1" else { return }
         MainActor.assumeIsolated { PhotosSync.shared.startIfEnabled() }
-        #if DEBUG
-        if ProcessInfo.processInfo.environment["FOTOS_UPDATE_TEST"] != nil { MainActor.assumeIsolated { SelfTest.updateTest() }; return }
-        #endif
-        MainActor.assumeIsolated { Updater.shared.checkAtLaunch() }
         #if DEBUG
         MainActor.assumeIsolated { SelfTest.runIfRequested() }
         #endif
@@ -35,9 +36,6 @@ struct FotosCommands: Commands {
     @Bindable var accounts = AccountStore.shared
 
     var body: some Commands {
-        CommandGroup(after: .appInfo) {
-            Button("Check for Updates…") { Task { await Updater.shared.check(manual: true) } }.disabled(Updater.shared.busy)
-        }
         CommandGroup(replacing: .newItem) {
             Button("New Album") { Menus.newAlbum(lib) }
                 .keyboardShortcut("n").disabled(!accounts.canWrite)
@@ -54,7 +52,7 @@ struct FotosCommands: Commands {
                 Button("Export Unmodified Original…") { Transfer.export(original: true) }
                     .keyboardShortcut("e", modifiers: [.command, .option])
             }.disabled(lib.targets.isEmpty)
-            Button("Share Link") { Task { await Menus.shareLink(lib) } }.disabled(lib.targets.isEmpty)
+            Button("Share Link") { Task { await Menus.shareLink(lib) } }.disabled(!accounts.canWrite || lib.targets.isEmpty)
         }
         CommandGroup(replacing: .printItem) {
             Button("Print…") { Task { await Printing.printSelection() } }

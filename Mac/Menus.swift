@@ -49,7 +49,7 @@ enum Menus {
         m.addItem(.separator())
         add("Export…", "square.and.arrow.up") { Transfer.export(original: false) }
         add("Export Unmodified Original…", "square.and.arrow.up.on.square") { Transfer.export(original: true) }
-        add(n == 1 ? "Share Link" : "Share Link for \(n) Items", "link") { await shareLink(lib) }
+        add(n == 1 ? "Share Link" : "Share Link for \(n) Items", "link", enabled: w) { await shareLink(lib) }
         add("Print…", "printer") { await Printing.printSelection() }
         m.addItem(.separator())
         add(lib.source == .hidden ? "Unhide" : "Hide", lib.source == .hidden ? "eye" : "eye.slash", enabled: w) { await lib.toggleHidden() }
@@ -106,6 +106,7 @@ enum Menus {
     }
 
     static func shareLink(_ lib: Library) async {
+        guard AccountStore.shared.canWrite else { return }
         let ids = lib.targets.map(\.id)
         guard !ids.isEmpty else { return }
         do {

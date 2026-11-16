@@ -1,36 +1,46 @@
 import Foundation
+import Security
 
-/// Anmeldeschlüssel je Konto in einer Datei, die nur der eigene Mac-Benutzer lesen darf
-/// (~/Library/Application Support/HomeRoll Desktop/accounts.json, Ordner 700, Datei 600).
-/// Grund: Die App ist ad hoc signiert – mit dem Schlüsselbund fragte der Mac nach jedem Update nach dem
-/// Schlüsselbund-Passwort. Der Inhalt ist ein Sitzungs-Token für den eigenen Immich-Server (kein Passwort), abmelden löscht ihn.
+/// Session credentials stay in the login Keychain, isolated from upstream and iOS builds.
 enum TokenStore {
-    private static var dir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent(Bundle.main.bundleIdentifier?.hasSuffix(".debug") == true ? "HomeRoll Desktop Test" : "HomeRoll Desktop")
-    }
-    private static var file: URL { dir.appendingPathComponent("accounts.json") }
-    private static let lock = NSLock()
+    private static var service: String { (Bundle.main.bundleIdentifier ?? "org.homeroll.desktop.local") + ".sessions" }
 
-    private static func load() -> [String: String] {
-        (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: file))) ?? [:]
+    struct Failure: LocalizedError {
+        let status: OSStatus
+        var errorDescription: String? { "Keychain access failed (\(status)). The account was not saved." }
     }
 
-    static func get(_ id: String) -> String? { lock.withLock { load()[id] } }
-
-    static func set(_ token: String?, for id: String) {
-        lock.withLock {
-            var all = load()
-            all[id] = token
-            let fm = FileManager.default
-            try? fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-            guard let d = try? JSONEncoder().encode(all) else { return }
-            if !fm.fileExists(atPath: file.path) { fm.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
-            try? d.write(to: file, options: .atomic)
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    static func set(_ token: String?, for id: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecAttrAccount as String: id,
+        ]
+        guard let token else {
+            let status = SecItemDelete(query as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else { throw Failure(status: status) }
+            return
         }
+        let value = Data(token.utf8)
+        var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: value] as CFDictionary)
+        if status == errSecItemNotFound {
+            var entry = query
+            entry[kSecValueData as String] = value
+            entry[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            status = SecItemAdd(entry as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw Failure(status: status) }
     }
 
-    static func token(for id: String) -> String? { get(id) }
+    static func token(for id: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecAttrAccount as String: id,
+            kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+            let data = result as? Data
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }

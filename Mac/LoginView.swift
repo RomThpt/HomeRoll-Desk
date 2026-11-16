@@ -5,7 +5,7 @@ import SwiftUI
 /// Anmeldung an einem Immich-Konto (Passwort tippt der Nutzer selbst; Token landet im Schlüsselbund je Konto).
 struct LoginView: View {
     var onDone: (() -> Void)? = nil
-    @State private var server = AccountStore.shared.accounts.first?.server ?? ""
+    @State private var server = AccountStore.shared.accounts.first?.server ?? (Bundle.main.object(forInfoDictionaryKey: "HomeRollDefaultServerURL") as? String ?? "")
     @State private var email = ""
     @State private var password = ""
     @State private var busy = false
@@ -144,10 +144,8 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Updates") {
-                Toggle("Check for updates at launch", isOn: Binding(get: { Updater.shared.auto }, set: { Updater.shared.auto = $0 }))
-                Text("Asks GitHub for the newest version of HomeRoll Desktop (version \(Updater.current) installed). Nothing about you or your photos is sent.")
+                Text("This local build is updated only after source review and compilation. Remote installation is disabled.")
                     .font(.caption).foregroundStyle(.secondary)
-                Button("Check Now") { Task { await Updater.shared.check(manual: true) } }.disabled(Updater.shared.busy)
             }
             Section("Keyboard (like Photos)") {
                 Text("Space/double-click open · ←/→ browse · . favorite · ⌫ delete · ⌘L hide · ⌘R rotate · ⌘I info · ⌘+/⌘− zoom · ⇧⌘I import · ⇧⌘E export · ⌥⌘E export original · ⌃⌘A add to last album")

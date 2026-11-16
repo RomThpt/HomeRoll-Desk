@@ -186,7 +186,12 @@ final class Library {
         guard ImmichClient.shared.isLoggedIn else { return }
         if source == .albums || albums.isEmpty { await loadAlbums() }
         if source == .people { await loadPeople(); return }
-        if source == .memories { memories = (try? await api.memories()) ?? []; return }
+        guard g == generation else { return }
+        if source == .memories {
+            let loaded = (try? await api.memories()) ?? []
+            guard g == generation else { return }
+            memories = loaded; return
+        }
         if source == .map || source == .duplicates || source == .albums { return }   // eigene Ansichten laden selbst
         loading = true
         defer { if g == generation { loading = false } }
@@ -377,10 +382,17 @@ final class Library {
         }
     }
 
-    func loadAlbums() async { albums = ((try? await api.albums()) ?? []).sorted { $0.albumName.localizedStandardCompare($1.albumName) == .orderedAscending } }
+    func loadAlbums() async {
+        let revision = api.sessionRevision
+        let loaded = (try? await api.albums()) ?? []
+        guard revision == api.sessionRevision else { return }
+        albums = loaded.sorted { $0.albumName.localizedStandardCompare($1.albumName) == .orderedAscending }
+    }
     /// Benannte zuerst (wie Fotos), unbenannte dahinter.
     func loadPeople() async {
+        let revision = api.sessionRevision
         let p = (try? await api.people()) ?? []
+        guard revision == api.sessionRevision else { return }
         var merged = p
         for local in people {
             if let idx = merged.firstIndex(where: { $0.id == local.id }) {

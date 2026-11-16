@@ -178,6 +178,6 @@ struct AlbumsOverview: View {
 
     private func newFolder() {
         guard let name = Menus.ask("New Folder", info: "Folder name", value: "New Folder"), !name.isEmpty else { return }
-        withAnimation(.snappy) { folders.create(name) }
+        _ = withAnimation(.snappy) { folders.create(name) }
     }
 }

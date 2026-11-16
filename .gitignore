@@ -5,3 +5,5 @@ build-app/
 *.zip
 .DS_Store
 xcuserdata/
+project.local.yml
+*.log

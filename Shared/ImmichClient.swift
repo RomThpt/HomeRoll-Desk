@@ -1,21 +1,29 @@
 import AVFoundation
 import CryptoKit
 import Foundation
-#if canImport(UIKit)
-import UIKit
-#endif
 import UniformTypeIdentifiers
 
+#if canImport(UIKit)
+    import UIKit
+#endif
+
 enum APIError: LocalizedError {
-    case notLoggedIn, http(Int, String), badURL, emailAsServer, notImmich, insecureServer
+    case notLoggedIn
+    case http(Int, String)
+    case badURL, emailAsServer, notImmich, insecureServer
     var errorDescription: String? {
         switch self {
         case .notLoggedIn: String(localized: "Nicht angemeldet")
         case .http(let c, let m): String(localized: "Server-Fehler \(c): \(m)")
         case .badURL: String(localized: "Ungültige Server-Adresse")
-        case .emailAsServer: String(localized: "Das ist eine E-Mail-Adresse. Ins erste Feld gehört die Adresse deines Immich-Servers, z. B. http://192.168.1.20:2283")
+        case .emailAsServer:
+            String(localized: "Das ist eine E-Mail-Adresse. Ins erste Feld gehört die Adresse deines Immich-Servers, z. B. http://192.168.1.20:2283")
         case .notImmich: String(localized: "Unter dieser Adresse antwortet kein Immich-Server. Stimmen Adresse und Port (meist 2283)?")
-        case .insecureServer: String(localized: "Diese Adresse liegt im Internet, aber ohne https – Passwort und Fotos gingen unverschlüsselt durchs Netz. Bitte https:// verwenden (z. B. über einen Reverse-Proxy) oder per VPN die Heimnetz-Adresse.")
+        case .insecureServer:
+            String(
+                localized:
+                    "Diese Adresse liegt im Internet, aber ohne https – Passwort und Fotos gingen unverschlüsselt durchs Netz. Bitte https:// verwenden (z. B. über einen Reverse-Proxy) oder per VPN die Heimnetz-Adresse."
+            )
         }
     }
 }
@@ -25,12 +33,16 @@ enum APIError: LocalizedError {
 final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     static let shared = ImmichClient()
 
-    private(set) var baseURL: URL?
-    private(set) var token: String?
+    private let stateLock = NSLock()
+    private var connection: (server: URL?, token: String?, revision: UUID) = (nil, nil, UUID())
+    var baseURL: URL? { stateLock.withLock { connection.server } }
+    var token: String? { stateLock.withLock { connection.token } }
+    var sessionRevision: UUID { stateLock.withLock { connection.revision } }
     private var session: URLSession!
     private let anchor: SecCertificate? = {
         guard let url = Bundle.main.url(forResource: "HeimnetzCA", withExtension: "der"),
-              let data = try? Data(contentsOf: url) else { return nil }
+            let data = try? Data(contentsOf: url)
+        else { return nil }
         return SecCertificateCreateWithData(nil, data as CFData)
     }()
 
@@ -38,35 +50,54 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// Mac: API-Antworten nie aus dem Zwischenspeicher (Immich schickt nur ETag → sonst veraltete Alben/Infos).
     nonisolated(unsafe) static var freshAPI = false
 
-    override init() {
+    override convenience init() { self.init(configuration: .default) }
+
+    init(configuration: URLSessionConfiguration) {
         super.init()
-        let cfg = URLSessionConfiguration.default
-        cfg.urlCache = URLCache(memoryCapacity: 64 << 20, diskCapacity: 1 << 30)   // 1 GB Bild-Cache
+        let cfg = configuration
+        cfg.urlCache = URLCache(memoryCapacity: 64 << 20, diskCapacity: 0)  // Memory only; import clients never persist media responses.
         cfg.requestCachePolicy = .useProtocolCachePolicy
         cfg.httpMaximumConnectionsPerHost = 8
         cfg.timeoutIntervalForRequest = 30
         session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-        // Der Schlüsselbund überlebt das Löschen der App, die Einstellungen nicht: Token ohne gültigen gespeicherten
-        // Server stammen aus einer früheren Installation (oder 1.0.1 hat Eingaben zu früh gespeichert) → nicht nutzen,
-        // sonst startet die App angemeldet mit kaputter Adresse und kommt nie zum Login (Issue #1). Die nächste
-        // Anmeldung überschreibt das Token.
-        if let s = UserDefaults.standard.string(forKey: "serverURL"), let u = Self.validBase(s) { baseURL = u }
-        else { UserDefaults.standard.removeObject(forKey: "serverURL") }
-        token = baseURL != nil ? Keychain.get("accessToken") : nil
-        #if DEBUG
-        // Simulator-Tests: Token/Server per Startumgebung (SIMCTL_CHILD_FOTOS_*), kein Passwort-Tippen.
-        let env = ProcessInfo.processInfo.environment
-        if let s = env["FOTOS_SERVER"], let t = env["FOTOS_TOKEN"] { baseURL = URL(string: s); token = t }
-        #endif
+    }
+
+    func scopedClient() throws -> ImmichClient {
+        let state = stateLock.withLock { connection }
+        guard let server = state.server, let token = state.token else { throw APIError.notLoggedIn }
+        let client = ImmichClient(configuration: .ephemeral)
+        client.activate(server: server, token: token)
+        return client
+    }
+
+    func cancelRequests() { session.invalidateAndCancel() }
+
+    static func sameOrigin(_ a: URL, _ b: URL) -> Bool {
+        func port(_ u: URL) -> Int? { u.port ?? (u.scheme == "https" ? 443 : u.scheme == "http" ? 80 : nil) }
+        return a.scheme?.lowercased() == b.scheme?.lowercased() && a.host()?.lowercased() == b.host()?.lowercased() && port(a) == port(b)
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        guard let from = response.url, let to = request.url, Self.sameOrigin(from, to) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
     }
 
     var isLoggedIn: Bool { baseURL != nil && token != nil }
 
     /// Mac-App mit mehreren Konten: gespeichertes Konto aktiv schalten (Token kommt aus dem Speicher je Konto).
     func activate(server: URL, token: String) {
-        baseURL = server
-        self.token = token
-        videoLock.withLock { videoFallback = [:]; realtimeHLS = nil }
+        stateLock.withLock { connection = (server, token, UUID()) }
+        videoLock.withLock {
+            videoFallback = [:]
+            realtimeHLS = nil
+        }
     }
 
     // MARK: Anmeldung
@@ -80,17 +111,23 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     /// Erst nach erfolgreicher Anmeldung Server und Token übernehmen und merken.
     private func adopt(_ url: URL, _ r: LoginResponse) {
-        baseURL = url
-        token = r.accessToken
-        UserDefaults.standard.set(url.absoluteString, forKey: "serverURL")
-        Keychain.set(r.accessToken, for: "accessToken")
+        activate(server: url, token: r.accessToken)
     }
 
     // MARK: Anmeldung per SSO (OAuth) – wie die Immich-App. Nötig bei Servern ohne Passwort-Anmeldung, z. B. bei
     // Immich-Anbietern wie PixelUnion („Login with …“).
 
-    struct LoginOptions: Sendable { let password: Bool; let sso: Bool; let ssoTitle: String? }
-    struct SSOFlow: Sendable { let base: URL; let url: URL; let state: String; let verifier: String }
+    struct LoginOptions: Sendable {
+        let password: Bool
+        let sso: Bool
+        let ssoTitle: String?
+    }
+    struct SSOFlow: Sendable {
+        let base: URL
+        let url: URL
+        let state: String
+        let verifier: String
+    }
     /// Rücksprung-Adresse der Immich-App: beim Anbieter ohnehin freigeschaltet, Immich-Server kennen sie
     static let ssoScheme = "app.immich"
     private static let ssoRedirect = "app.immich:///oauth-callback"
@@ -98,22 +135,28 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// Was die Anmeldeseite des Servers anbietet (öffentlich abrufbar, ohne Anmeldung).
     func loginOptions(server: String) async throws -> LoginOptions {
         let url = try await findServer(server)
-        struct Features: Decodable { let oauth: Bool?; let passwordLogin: Bool? }
+        struct Features: Decodable {
+            let oauth: Bool?
+            let passwordLogin: Bool?
+        }
         struct Config: Decodable { let oauthButtonText: String? }
         let f: Features = try await publicJSON(url, "server/features")
         let c: Config? = try? await publicJSON(url, "server/config")
-        return LoginOptions(password: f.passwordLogin ?? true, sso: f.oauth ?? false,
-                            ssoTitle: c?.oauthButtonText.flatMap { $0.isEmpty ? nil : $0 })
+        return LoginOptions(
+            password: f.passwordLogin ?? true, sso: f.oauth ?? false,
+            ssoTitle: c?.oauthButtonText.flatMap { $0.isEmpty ? nil : $0 })
     }
 
     /// Schritt 1: Anmeldeseite des Anbieters holen – mit eigenem state und PKCE (S256), wie die Immich-App.
     func ssoStart(server: String) async throws -> SSOFlow {
         let base = try await findServer(server)
-        let state = Self.randomKey(32), verifier = Self.randomKey(64)
+        let state = Self.randomKey(32)
+        let verifier = Self.randomKey(64)
         let challenge = Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
         struct Start: Decodable { let url: String }
-        let r: Start = try await publicJSON(base, "oauth/authorize",
-                                            body: ["redirectUri": Self.ssoRedirect, "state": state, "codeChallenge": challenge])
+        let r: Start = try await publicJSON(
+            base, "oauth/authorize",
+            body: ["redirectUri": Self.ssoRedirect, "state": state, "codeChallenge": challenge])
         guard let u = URL(string: r.url) else { throw APIError.badURL }
         return SSOFlow(base: base, url: u, state: state, verifier: verifier)
     }
@@ -123,8 +166,9 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         var s = callback.absoluteString
         // iOS liefert die Adresse teils mit nur einem Schrägstrich zurück
         if s.hasPrefix("app.immich:/oauth-callback") { s = Self.ssoRedirect + s.dropFirst("app.immich:/oauth-callback".count) }
-        let r: LoginResponse = try await publicJSON(flow.base, "oauth/callback",
-                                                    body: ["url": s, "state": flow.state, "codeVerifier": flow.verifier])
+        let r: LoginResponse = try await publicJSON(
+            flow.base, "oauth/callback",
+            body: ["url": s, "state": flow.state, "codeVerifier": flow.verifier])
         adopt(flow.base, r)
         return r
     }
@@ -177,7 +221,8 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// http(s)-Adresse mit Rechnername und ohne Benutzerteil („test@email.com“ wäre sonst Benutzer test auf email.com).
     static func validBase(_ s: String) -> URL? {
         guard let u = URL(string: s), ["http", "https"].contains(u.scheme?.lowercased() ?? ""),
-              let h = u.host(), !h.isEmpty, u.user == nil else { return nil }
+            let h = u.host(), !h.isEmpty, u.user == nil
+        else { return nil }
         return u
     }
 
@@ -192,14 +237,18 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         guard !tries.isEmpty else { throw s.contains("@") && !s.contains("/") ? APIError.emailAsServer : APIError.badURL }
         tries = tries.filter { $0.scheme?.lowercased() == "https" || Self.isPrivateHost($0.host() ?? "") }
         guard !tries.isEmpty else { throw APIError.insecureServer }
-        var reached = false, lastError: Error?
+        var reached = false
+        var lastError: Error?
         for u in tries {
             var req = URLRequest(url: u.appendingPathComponent("api/server/ping"))
             req.timeoutInterval = 10
             do {
                 let (data, resp) = try await session.data(for: req)
                 if (resp as? HTTPURLResponse)?.statusCode == 200,
-                   (try? JSONDecoder().decode([String: String].self, from: data))?["res"] == "pong" { return u }
+                    (try? JSONDecoder().decode([String: String].self, from: data))?["res"] == "pong"
+                {
+                    return u
+                }
                 reached = true
             } catch { lastError = error }
         }
@@ -208,10 +257,11 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     }
 
     func logout() {
-        token = nil
-        Keychain.set(nil, for: "accessToken")
-        videoLock.withLock { videoFallback = [:]; realtimeHLS = nil }
-        AppGroup.saveAccess(nil)
+        stateLock.withLock { connection = (nil, nil, UUID()) }
+        videoLock.withLock {
+            videoFallback = [:]
+            realtimeHLS = nil
+        }
         // Bilder/Antworten des Kontos nicht auf dem Gerät lassen (bis 1 GB, GitHub-Issue #8)
         session.configuration.urlCache?.removeAllCachedResponses()
         URLCache.shared.removeAllCachedResponses()
@@ -227,7 +277,9 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     }
 
     func authorized(_ url: URL) throws -> URLRequest {
-        guard let token else { throw APIError.notLoggedIn }
+        let state = stateLock.withLock { connection }
+        guard let token = state.token, let server = state.server else { throw APIError.notLoggedIn }
+        guard Self.sameOrigin(server, url) else { throw APIError.badURL }
         var r = URLRequest(url: url)
         r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         return r
@@ -238,23 +290,31 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// Video vom Server für AVFoundation. Der Header-Schlüssel ist keine öffentliche API (unter iOS 27 vermutlich ignoriert
     /// → 401, schwarzes Video ohne Filmstreifen, Issue #1); darum zusätzlich Immichs Sitzungs-Cookie.
     func avAsset(_ url: URL) -> AVURLAsset {
-        var opts: [String: Any] = ["AVURLAssetHTTPHeaderFieldsKey": authHeaders]
-        if let token, let host = url.host(), let c = HTTPCookie(properties: [
-            .domain: host, .path: "/", .name: "immich_access_token", .value: token]) {
+        guard let request = try? authorized(url) else { return AVURLAsset(url: url) }
+        var opts: [String: Any] = ["AVURLAssetHTTPHeaderFieldsKey": request.allHTTPHeaderFields ?? [:]]
+        if let header = request.value(forHTTPHeaderField: "Authorization"), let host = url.host(),
+            let c = HTTPCookie(properties: [
+                .domain: host, .path: "/", .name: "immich_access_token", .value: String(header.dropFirst(7)),
+            ])
+        {
             opts[AVURLAssetHTTPCookiesKey] = [c]
         }
         return AVURLAsset(url: url, options: opts)
     }
 
-    func request<T: Decodable>(_ path: String, query: [String: String] = [:], method: String = "GET",
-                               body: Data? = nil, auth: Bool = true) async throws -> T {
+    func request<T: Decodable>(
+        _ path: String, query: [String: String] = [:], method: String = "GET",
+        body: Data? = nil, auth: Bool = true
+    ) async throws -> T {
         let data = try await raw(path, query: query, method: method, body: body, auth: auth)
         return try decoder.decode(T.self, from: data)
     }
 
     @discardableResult
-    func raw(_ path: String, query: [String: String] = [:], method: String = "GET",
-             body: Data? = nil, auth: Bool = true) async throws -> Data {
+    func raw(
+        _ path: String, query: [String: String] = [:], method: String = "GET",
+        body: Data? = nil, auth: Bool = true
+    ) async throws -> Data {
         var req = auth ? try authorized(try url(path, query: query)) : URLRequest(url: try url(path, query: query))
         req.httpMethod = method
         if Self.freshAPI { req.cachePolicy = .reloadIgnoringLocalCacheData }
@@ -263,8 +323,13 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
         let (data, resp): (Data, URLResponse)
-        do { (data, resp) = try await session.data(for: req); Connectivity.report(nil) }
-        catch { Connectivity.report(error); throw error }
+        do {
+            (data, resp) = try await session.data(for: req)
+            Connectivity.report(nil)
+        } catch {
+            Connectivity.report(error)
+            throw error
+        }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             if code == 401 { await MainActor.run { NotificationCenter.default.post(name: .sessionExpired, object: nil) } }
@@ -293,7 +358,9 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     func asset(_ id: String) async throws -> AssetDTO { try await request("assets/\(id)") }
 
     func memories() async throws -> [MemoryDTO] {
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX")
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
         return try await request("memories", query: ["for": f.string(from: Date())])
     }
 
@@ -312,9 +379,14 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         struct Link: Decodable { let key: String }
         struct Config: Decodable { let externalDomain: String? }
         let exp = ISO8601DateFormatter().string(from: Date().addingTimeInterval(Double(days) * 86400))
-        let l: Link = try await request("shared-links", method: "POST", body: json(["type": "INDIVIDUAL", "assetIds": ids,
-                                                                                  "allowDownload": true, "showMetadata": false,
-                                                                                  "expiresAt": exp] as [String: Any]))
+        let l: Link = try await request(
+            "shared-links", method: "POST",
+            body: json(
+                [
+                    "type": "INDIVIDUAL", "assetIds": ids,
+                    "allowDownload": true, "showMetadata": false,
+                    "expiresAt": exp,
+                ] as [String: Any]))
         let cfg: Config? = try? await request("server/config")
         let base = cfg?.externalDomain.flatMap { $0.isEmpty ? nil : URL(string: $0) } ?? baseURL
         return base?.appendingPathComponent("share").appendingPathComponent(l.key)
@@ -355,7 +427,10 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     /// Anzahl Fotos und Videos in der Mediathek (für die Fußzeile wie in Apples Fotos-App).
     func statistics() async -> (images: Int, videos: Int)? {
-        struct S: Decodable { let images: Int; let videos: Int }
+        struct S: Decodable {
+            let images: Int
+            let videos: Int
+        }
         guard let s: S = try? await request("assets/statistics", query: ["visibility": "timeline"]) else { return nil }
         return (s.images, s.videos)
     }
@@ -366,14 +441,18 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     }
 
     /// Wie `search`, gibt aber den Cursor für die nächste Seite zurück (nil = alles geholt) – für „Mehr laden“.
-    @MainActor func searchPage(filter: [String: Any], size: Int, cursor start: String? = nil,
-                               order: String = "desc") async throws -> (items: [AssetDTO], next: String?) {
+    @MainActor func searchPage(
+        filter: [String: Any], size: Int, cursor start: String? = nil,
+        order: String = "desc"
+    ) async throws -> (items: [AssetDTO], next: String?) {
         let filter = Self.visible(filter)
         var out: [AssetDTO] = []
         var cursor = start
         repeat {
-            var body: [String: Any] = ["filter": filter, "size": min(1000, size - out.count), "withExif": true,
-                                       "orderBy": ["field": "fileCreatedAt", "direction": order]]
+            var body: [String: Any] = [
+                "filter": filter, "size": min(1000, size - out.count), "withExif": true,
+                "orderBy": ["field": "fileCreatedAt", "direction": order],
+            ]
             if let cursor { body["cursor"] = cursor }
             let r: SearchResponseDTO = try await request("search/metadata", method: "POST", body: json(body))
             out += r.assets.items
@@ -386,7 +465,9 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// („hidden“) und Ausgeblendetes („archive“) mit.
     static func visible(_ f: [String: Any]) -> [String: Any] {
         guard f["visibility"] == nil, f["trashedAt"] == nil else { return f }
-        var f = f; f["visibility"] = ["eq": "timeline"]; return f
+        var f = f
+        f["visibility"] = ["eq": "timeline"]
+        return f
     }
 
     /// KI-Suche (mehrsprachiges Bild-Text-Modell auf dem Server); optional mit zusätzlichem Filter.
@@ -400,7 +481,12 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// Reverse-Proxy unter /fotos-dienst/<name> (siehe server/README.md).
     func serviceURL(_ name: String, port: Int) -> URL? {
         guard let base = baseURL, var c = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return nil }
-        if c.port == 2283 { c.port = port; c.path = "/\(name)" } else { c.path = "/fotos-dienst/\(name)" }
+        if c.port == 2283 {
+            c.port = port
+            c.path = "/\(name)"
+        } else {
+            c.path = "/fotos-dienst/\(name)"
+        }
         return c.url
     }
 
@@ -408,12 +494,14 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// nil = Dienst nicht erreichbar → App zeigt dann die ungeprüfte Liste.
     func relevant(_ query: String, ids: [String]) async -> Set<String>? {
         guard !ids.isEmpty, let url = serviceURL("relevanz", port: 2284), var req = try? authorized(url) else { return nil }
-        req.httpMethod = "POST"; req.timeoutInterval = 8
+        req.httpMethod = "POST"
+        req.timeoutInterval = 8
         req.httpBody = json(["query": query, "ids": ids] as [String: Any])
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         struct R: Decodable { let keep: [String] }
         guard let (data, resp) = try? await session.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200,
-              let r = try? decoder.decode(R.self, from: data) else { return nil }
+            let r = try? decoder.decode(R.self, from: data)
+        else { return nil }
         return Set(r.keep)
     }
 
@@ -421,12 +509,14 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// nil = Dienst nicht erreichbar.
     func sensitive(_ ids: [String], queries: [String]) async -> Set<String>? {
         guard !ids.isEmpty, let url = serviceURL("relevanz", port: 2284), var req = try? authorized(url) else { return nil }
-        req.httpMethod = "POST"; req.timeoutInterval = 240
+        req.httpMethod = "POST"
+        req.timeoutInterval = 240
         req.httpBody = json(["check": ids, "queries": queries] as [String: Any])
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         struct R: Decodable { let flagged: [String] }
         guard let (data, resp) = try? await session.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200,
-              let r = try? decoder.decode(R.self, from: data) else { return nil }
+            let r = try? decoder.decode(R.self, from: data)
+        else { return nil }
         return Set(r.flagged)
     }
 
@@ -435,18 +525,20 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         let faceId: String
         let assetId: String
         let distance: Double
-        let box: [Int]       // x1, y1, x2, y2 in Pixeln von `size`
-        let size: [Int]      // Breite, Höhe des Bildes, auf dem das Gesicht erkannt wurde
+        let box: [Int]  // x1, y1, x2, y2 in Pixeln von `size`
+        let size: [Int]  // Breite, Höhe des Bildes, auf dem das Gesicht erkannt wurde
         var id: String { faceId }
     }
     func similarFaces(_ personId: String) async -> [FaceSuggestion]? {
         guard let url = serviceURL("relevanz", port: 2284), var req = try? authorized(url) else { return nil }
-        req.httpMethod = "POST"; req.timeoutInterval = 15
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
         req.httpBody = json(["personId": personId])
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         struct R: Decodable { let faces: [FaceSuggestion] }
         guard let (data, resp) = try? await session.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200,
-              let r = try? decoder.decode(R.self, from: data) else { return nil }
+            let r = try? decoder.decode(R.self, from: data)
+        else { return nil }
         return r.faces
     }
     /// Alle erkannten Gesichter eines Fotos (Immich: GET /faces?id={assetId})
@@ -457,7 +549,11 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     /// „Nicht diese Person“ (REA: PXPhotoKitNotThisPersonActionPerformer): Immich kennt kein Lösen eines Gesichts –
     /// wie die Immich-Weboberfläche kommt das Gesicht zu einer neuen, unbenannten Person (leere räumt Immich selbst weg).
     func notThisPerson(asset: String, person: String) async throws {
-        struct Face: Decodable { let id: String; let person: P?; struct P: Decodable { let id: String } }
+        struct Face: Decodable {
+            let id: String
+            let person: P?
+            struct P: Decodable { let id: String }
+        }
         let faces: [Face] = try await request("faces", query: ["id": asset])
         guard let face = faces.first(where: { $0.person?.id == person }) else { return }
         struct NewPerson: Decodable { let id: String }
@@ -476,11 +572,15 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         let boundary = "fotos-\(UUID().uuidString)"
         var body = Data()
         for (name, file, type, d) in [("image", "bild.jpg", "image/jpeg", image), ("mask", "maske.png", "image/png", mask)] {
-            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"; filename=\"\(safeFilename(file))\"\r\nContent-Type: \(type)\r\n\r\n".data(using: .utf8)!)
-            body.append(d); body.append("\r\n".data(using: .utf8)!)
+            body.append(
+                "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"; filename=\"\(safeFilename(file))\"\r\nContent-Type: \(type)\r\n\r\n".data(
+                    using: .utf8)!)
+            body.append(d)
+            body.append("\r\n".data(using: .utf8)!)
         }
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-        req.httpMethod = "POST"; req.timeoutInterval = 120
+        req.httpMethod = "POST"
+        req.timeoutInterval = 120
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         guard let (d, resp) = try? await session.upload(for: req, from: body), (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
         return d
@@ -498,7 +598,8 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     // MARK: Mehrfach-Aktionen (Auswahl)
 
     func update(_ ids: [String], _ fields: [String: Any]) async throws {
-        var body = fields; body["ids"] = ids
+        var body = fields
+        body["ids"] = ids
         try await raw("assets", method: "PUT", body: json(body))
     }
 
@@ -538,7 +639,8 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     }
     func metadata(_ id: String, key: String) async -> [String: Any]? {
         guard let d = try? await raw("assets/\(id)/metadata/\(key)"),
-              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+            let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+        else { return nil }
         return o["value"] as? [String: Any]
     }
 
@@ -553,16 +655,22 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         func field(_ name: String, _ value: String) {
             body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
         }
-        field("fileCreatedAt", created); field("fileModifiedAt", ISO8601DateFormatter().string(from: Date())); field("filename", filename)
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"\(safeFilename(filename))\"\r\nContent-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
-        body.append(data); body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        field("fileCreatedAt", created)
+        field("fileModifiedAt", ISO8601DateFormatter().string(from: Date()))
+        field("filename", filename)
+        body.append(
+            "--\(boundary)\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"\(safeFilename(filename))\"\r\nContent-Type: image/jpeg\r\n\r\n"
+                .data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         var req = try authorized(try url("assets"))
         req.httpMethod = "POST"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 300
         let (d, resp) = try await session.upload(for: req, from: body)
         guard let h = resp as? HTTPURLResponse, (200..<300).contains(h.statusCode),
-              let o = try JSONSerialization.jsonObject(with: d) as? [String: Any], let id = o["id"] as? String else {
+            let o = try JSONSerialization.jsonObject(with: d) as? [String: Any], let id = o["id"] as? String
+        else {
             throw APIError.http((resp as? HTTPURLResponse)?.statusCode ?? 0, String(data: d, encoding: .utf8) ?? "")
         }
         return id
@@ -571,29 +679,45 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     /// Kennt der Server die Datei schon (SHA1)? → vorhandene ID, sonst nil.
     func bulkUploadCheck(id: String, checksum: String) async throws -> String? {
-        struct R: Decodable { struct Item: Decodable { let action: String; let assetId: String?; let isTrashed: Bool? }; let results: [Item] }
-        let r: R = try await request("assets/bulk-upload-check", method: "POST",
-                                     body: json(["assets": [["id": id, "checksum": checksum]]]))
+        struct R: Decodable {
+            struct Item: Decodable {
+                let action: String
+                let assetId: String?
+                let isTrashed: Bool?
+            }
+            let results: [Item]
+        }
+        let r: R = try await request(
+            "assets/bulk-upload-check", method: "POST",
+            body: json(["assets": [["id": id, "checksum": checksum]]]))
         guard let i = r.results.first, i.action == "reject", let a = i.assetId, i.isTrashed != true else { return nil }
         return a
     }
 
-    struct UploadResult: Decodable { let id: String; let status: String }
+    struct UploadResult: Decodable {
+        let id: String
+        let status: String
+    }
 
     /// Lädt eine Datei vom Datenträger hoch (Multipart wird als Datei gebaut – auch große Videos ohne viel Speicher).
-    func uploadAsset(file: URL, filename: String, uti: String, fields: [String: String],
-                     checksum: String, expensive: Bool) async throws -> UploadResult {
+    func uploadAsset(
+        file: URL, filename: String, uti: String, fields: [String: String],
+        checksum: String, expensive: Bool
+    ) async throws -> UploadResult {
         let body = FileManager.default.temporaryDirectory.appendingPathComponent("upload-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: body) }
-        let req = try prepareUpload(file: file, filename: filename, uti: uti, fields: fields, checksum: checksum,
-                                    expensive: expensive, body: body)
+        let req = try prepareUpload(
+            file: file, filename: filename, uti: uti, fields: fields, checksum: checksum,
+            expensive: expensive, body: body)
         let (d, resp) = try await session.upload(for: req, fromFile: body)
         return try uploadResult(d, resp)
     }
 
     /// Multipart-Rumpf nach `body` schreiben und die passende Anfrage bauen (auch für die Hintergrund-Übertragung).
-    func prepareUpload(file: URL, filename: String, uti: String, fields: [String: String],
-                       checksum: String, expensive: Bool, body: URL) throws -> URLRequest {
+    func prepareUpload(
+        file: URL, filename: String, uti: String, fields: [String: String],
+        checksum: String, expensive: Bool, body: URL
+    ) throws -> URLRequest {
         let boundary = "fotos-\(UUID().uuidString)"
         FileManager.default.createFile(atPath: body.path, contents: nil)
         let out = try FileHandle(forWritingTo: body)
@@ -608,7 +732,8 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         // stückweise mit autoreleasepool (sonst bleibt die ganze Datei im Speicher, siehe Shared/FileChunks.swift)
         while try autoreleasepool(invoking: {
             guard let chunk = try src.read(upToCount: 4 << 20), !chunk.isEmpty else { return false }
-            try out.write(contentsOf: chunk); return true
+            try out.write(contentsOf: chunk)
+            return true
         }) {}
         try src.close()
         try out.write(contentsOf: Data("\r\n--\(boundary)--\r\n".utf8))
@@ -631,13 +756,34 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
         return try decoder.decode(UploadResult.self, from: d)
     }
 
+    /// Verify the server record before recording local progress; missing checksums fail closed.
+    func verify(_ receipt: MediaReceipt) async throws {
+        struct Remote: Decodable {
+            let id: String
+            let checksum: String?
+            let isTrashed: Bool?
+            let livePhotoVideoId: String?
+        }
+        let remote: Remote = try await request("assets/\(receipt.id)")
+        let hex = remote.checksum.flatMap { value -> String? in
+            if value.count == 40, value.allSatisfy({ $0.isHexDigit }) { return value.lowercased() }
+            return Data(base64Encoded: value)?.map { String(format: "%02x", $0) }.joined()
+        }
+        guard remote.id == receipt.id, remote.isTrashed != true, hex == receipt.checksum.lowercased(),
+            receipt.liveVideoID == nil || remote.livePhotoVideoId == receipt.liveVideoID
+        else {
+            throw ImportFailure.unverifiedMedia
+        }
+    }
+
     func duplicates() async throws -> [DuplicateGroupDTO] { try await request("duplicates") }
 
     /// Behält `keep`, verschiebt die übrigen der Gruppe in „Zuletzt gelöscht“.
     func resolveDuplicate(_ g: DuplicateGroupDTO, keep: [String]) async throws {
         let trash = g.assets.map(\.id).filter { !keep.contains($0) }
-        try await raw("duplicates/resolve", method: "POST",
-                      body: json(["groups": [["duplicateId": g.duplicateId, "keepAssetIds": keep, "trashAssetIds": trash]]]))
+        try await raw(
+            "duplicates/resolve", method: "POST",
+            body: json(["groups": [["duplicateId": g.duplicateId, "keepAssetIds": keep, "trashAssetIds": trash]]]))
     }
 
     func random(size: Int = 12) async throws -> [AssetDTO] {
@@ -712,8 +858,13 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
 
     func data(_ url: URL) async throws -> Data {
         let (d, resp): (Data, URLResponse)
-        do { (d, resp) = try await session.data(for: try authorized(url)); Connectivity.report(nil) }
-        catch { Connectivity.report(error); throw error }
+        do {
+            (d, resp) = try await session.data(for: try authorized(url))
+            Connectivity.report(nil)
+        } catch {
+            Connectivity.report(error)
+            throw error
+        }
         guard let h = resp as? HTTPURLResponse, (200..<300).contains(h.statusCode) else {
             throw APIError.http((resp as? HTTPURLResponse)?.statusCode ?? 0, "Medien")
         }
@@ -723,9 +874,11 @@ final class ImmichClient: NSObject, URLSessionDelegate, @unchecked Sendable {
     // MARK: TLS – Heimnetz-CA als zusätzlicher Anker
 
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async
-        -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        -> (URLSession.AuthChallengeDisposition, URLCredential?)
+    {
         guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let trust = challenge.protectionSpace.serverTrust else { return (.performDefaultHandling, nil) }
+            let trust = challenge.protectionSpace.serverTrust
+        else { return (.performDefaultHandling, nil) }
         if SecTrustEvaluateWithError(trust, nil) { return (.useCredential, URLCredential(trust: trust)) }
         if let anchor {
             SecTrustSetAnchorCertificates(trust, [anchor] as CFArray)

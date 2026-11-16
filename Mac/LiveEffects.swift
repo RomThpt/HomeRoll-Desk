@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import AVFoundation
 import CoreImage
 import SwiftUI
@@ -35,12 +36,19 @@ enum LiveMode: String, CaseIterable, Identifiable {
 /// Das kurze Video eines Live Photos einmal in den Cache laden (Bounce und Schlüsselbild im Editor brauchen eine lokale Datei).
 enum LiveClip {
     static func file(_ videoID: String) async -> URL? {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("live")
+        let revision = ImmichClient.shared.sessionRevision
+        guard let client = try? ImmichClient.shared.scopedClient() else { return nil }
+        defer { client.cancelRequests() }
+        let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let dir = root.appendingPathComponent(Bundle.main.bundleIdentifier ?? "HomeRollDesktopLocal")
+            .appendingPathComponent("live").appendingPathComponent(revision.uuidString)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let f = dir.appendingPathComponent("\(videoID).mov")
+        let key = SHA256.hash(data: Data(videoID.utf8)).map { String(format: "%02x", $0) }.joined()
+        let f = dir.appendingPathComponent(key + ".mov")
         if FileManager.default.fileExists(atPath: f.path) { return f }
-        guard let url = ImmichClient.shared.videoURL(videoID), let d = try? await ImmichClient.shared.data(url) else { return nil }
-        try? d.write(to: f, options: .atomic)
+        guard let url = client.videoURL(videoID), let data = try? await client.data(url),
+              revision == ImmichClient.shared.sessionRevision else { return nil }
+        do { try data.write(to: f, options: .atomic) } catch { return nil }
         return f
     }
 
@@ -86,7 +94,7 @@ struct LiveVideo: NSViewRepresentable {
     enum Style { case once, loop, bounce }
     let videoID: String
     let style: Style
-    var onEnd: () -> Void = {}
+    var onEnd: @MainActor @Sendable () -> Void = {}
 
     func makeCoordinator() -> Coord { Coord() }
     func makeNSView(context: Context) -> LayerView {
@@ -117,7 +125,7 @@ struct LiveVideo: NSViewRepresentable {
         private var task: Task<Void, Never>?
         private var bounceTask: Task<Void, Never>?
 
-        func start(_ id: String, style: Style, in v: LayerView, onEnd: @escaping () -> Void) {
+        func start(_ id: String, style: Style, in v: LayerView, onEnd: @escaping @MainActor @Sendable () -> Void) {
             task = Task { [weak self, weak v] in
                 guard let f = await LiveClip.file(id), !Task.isCancelled, let self, let v else { if !Task.isCancelled { onEnd() }; return }
                 let item = AVPlayerItem(url: f)
@@ -127,7 +135,7 @@ struct LiveVideo: NSViewRepresentable {
                     self.looper = AVPlayerLooper(player: p, templateItem: item)
                 case .once:
                     p.insert(item, after: nil)
-                    self.obs = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in onEnd() }
+                    self.obs = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { _ in MainActor.assumeIsolated { onEnd() } }
                 case .bounce:
                     p.insert(item, after: nil)
                     p.actionAtItemEnd = .pause
@@ -157,7 +165,7 @@ struct LiveVideo: NSViewRepresentable {
 struct LiveBadge: View {
     let mode: LiveMode
     let onHover: (Bool) -> Void
-    let onSelect: (LiveMode) -> Void
+    let onSelect: @MainActor @Sendable (LiveMode) -> Void
 
     var body: some View {
         Menu {

@@ -15,14 +15,32 @@ enum Transfer {
             lib.error = "Importing only works into an account set to “Use for imports from this Mac” (Settings → Accounts)."
             return
         }
+        guard let context = try? AccountStore.shared.beginImport() else { return }
+        defer { AccountStore.shared.endImport(context) }
         let files = await Task.detached { collect(urls) }.value
-        guard !files.isEmpty else { lib.status = "No photos or videos found"; return }
-        var new = 0, known = 0, failed = 0
+        guard (try? context.check()) != nil else {
+            lib.status = "Import stopped"
+            return
+        }
+        guard !files.isEmpty else {
+            lib.status = "No photos or videos found"
+            return
+        }
+        var new = 0
+        var known = 0
+        var failed = 0
         for (n, f) in files.enumerated() {
             lib.status = "Importing \(n + 1) of \(files.count)…"
             do {
-                if try await upload(f) { new += 1 } else { known += 1 }
-            } catch { failed += 1 }
+                try context.check()
+                if try await upload(f, context: context) { new += 1 } else { known += 1 }
+            } catch {
+                if context.cancelled || error is CancellationError {
+                    lib.status = "Import stopped"
+                    return
+                }
+                failed += 1
+            }
         }
         lib.status = "Import complete: \(new) new" + (known > 0 ? ", \(known) already in library" : "") + (failed > 0 ? ", \(failed) failed" : "")
         await lib.load()
@@ -42,28 +60,51 @@ enum Transfer {
             if dir.boolValue {
                 let e = fm.enumerator(at: u, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants])
                 while let f = e?.nextObject() as? URL { if ok(f) { out.append(f) } }
-            } else if ok(u) { out.append(u) }
+            } else if ok(u) {
+                out.append(u)
+            }
         }
         return out
     }
 
     /// true = neu hochgeladen, false = Server kannte die Datei schon (gleiche SHA1).
     static func upload(_ file: URL) async throws -> Bool {
-        let api = ImmichClient.shared
+        let context = try AccountStore.shared.beginImport()
+        defer { AccountStore.shared.endImport(context) }
+        return try await upload(file, context: context)
+    }
+
+    static func upload(_ file: URL, context: ImportSession) async throws -> Bool {
+        try context.check()
+        let api = context.client
         let sha1 = try await Task.detached { try sha1Hex(file) }.value
         let deviceAssetId = "mac-" + sha1
-        if try await api.bulkUploadCheck(id: deviceAssetId, checksum: sha1) != nil { return false }
+        try context.check()
+        if let id = try await api.bulkUploadCheck(id: deviceAssetId, checksum: sha1) {
+            try context.check()
+            try await api.verify(MediaReceipt(id: id, checksum: sha1, kind: 0, liveVideoID: nil))
+            try context.check()
+            return false
+        }
+        try context.check()
         let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
         let created = (attrs[.creationDate] as? Date) ?? Date()
         let modified = (attrs[.modificationDate] as? Date) ?? created
         let iso = ISO8601DateFormatter()
         let uti = UTType(filenameExtension: file.pathExtension)?.identifier ?? "public.data"
-        let r = try await api.uploadAsset(file: file, filename: file.lastPathComponent, uti: uti,
-                                          fields: ["fileCreatedAt": iso.string(from: min(created, modified)),
-                                                   "fileModifiedAt": iso.string(from: modified),
-                                                   "filename": file.lastPathComponent,
-                                                   "deviceAssetId": deviceAssetId, "deviceId": "HomeRoll-Desktop"],
-                                          checksum: sha1, expensive: true)
+        let r = try await api.uploadAsset(
+            file: file, filename: file.lastPathComponent, uti: uti,
+            fields: [
+                "fileCreatedAt": iso.string(from: min(created, modified)),
+                "fileModifiedAt": iso.string(from: modified),
+                "filename": file.lastPathComponent,
+                "deviceAssetId": deviceAssetId, "deviceId": "HomeRoll-Desktop",
+            ],
+            checksum: sha1, expensive: true)
+        try context.check()
+        guard ["created", "duplicate"].contains(r.status), !r.id.isEmpty else { throw ImportFailure.invalidResponse }
+        try await api.verify(MediaReceipt(id: r.id, checksum: sha1, kind: 0, liveVideoID: nil))
+        try context.check()
         return r.status != "duplicate"
     }
 
@@ -74,14 +115,17 @@ enum Transfer {
         // stückweise mit autoreleasepool – sonst bleibt die ganze Datei im Speicher (große Videos, HomeRoll-Issue #2)
         while try autoreleasepool(invoking: {
             guard let chunk = try h.read(upToCount: 4 << 20), !chunk.isEmpty else { return false }
-            sha.update(data: chunk); return true
+            sha.update(data: chunk)
+            return true
         }) {}
         return sha.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     static func chooseAndImport() {
         let p = NSOpenPanel()
-        p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = true
+        p.canChooseFiles = true
+        p.canChooseDirectories = true
+        p.allowsMultipleSelection = true
         p.allowedContentTypes = [.image, .movie, .folder]
         p.prompt = "Import"
         p.message = "Choose photos, videos, or folders for “\(AccountStore.shared.current?.name ?? "")”"
@@ -109,7 +153,9 @@ enum Transfer {
         let items = lib.targets
         guard !items.isEmpty else { return }
         let p = NSOpenPanel()
-        p.canChooseDirectories = true; p.canChooseFiles = false; p.canCreateDirectories = true
+        p.canChooseDirectories = true
+        p.canChooseFiles = false
+        p.canCreateDirectories = true
         p.prompt = "Export"
         p.message = "Export \(itemsText(items.count))\(original ? " as unmodified originals" : "") to…"
         guard p.runModal() == .OK, let dir = p.url else { return }
@@ -127,10 +173,13 @@ enum Transfer {
     }
 
     nonisolated static func unique(_ u: URL) -> URL {
-        var url = u, n = 2
-        let base = u.deletingPathExtension().lastPathComponent, ext = u.pathExtension
+        var url = u
+        var n = 2
+        let base = u.deletingPathExtension().lastPathComponent
+        let ext = u.pathExtension
         while FileManager.default.fileExists(atPath: url.path) {
-            url = u.deletingLastPathComponent().appendingPathComponent("\(base) \(n)").appendingPathExtension(ext); n += 1
+            url = u.deletingLastPathComponent().appendingPathComponent("\(base) \(n)").appendingPathExtension(ext)
+            n += 1
         }
         return url
     }
@@ -140,16 +189,21 @@ enum Transfer {
 final class AssetPromise: NSObject, NSFilePromiseProviderDelegate {
     let asset: Asset
     let name: String
-    init(_ a: Asset, name: String) { asset = a; self.name = name }
+    init(_ a: Asset, name: String) {
+        asset = a
+        self.name = name
+    }
 
     func filePromiseProvider(_ p: NSFilePromiseProvider, fileNameForType fileType: String) -> String { name }
 
     func filePromiseProvider(_ p: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping (Error?) -> Void) {
         let id = asset.id
-        let done = Done(completionHandler)   // AppKit erwartet genau einen Aufruf, von beliebigem Thread
+        let done = Done(completionHandler)  // AppKit erwartet genau einen Aufruf, von beliebigem Thread
         Task.detached {
-            do { try await Transfer.download(id, edited: true, to: url); done.call(nil) }
-            catch { done.call(error) }
+            do {
+                try await Transfer.download(id, edited: true, to: url)
+                done.call(nil)
+            } catch { done.call(error) }
         }
     }
 
